@@ -203,7 +203,124 @@ setup instructions.
    polymorphic pattern, a child record can belong to any kind of thing. In delegated
    type, the parent record can have any kind of thing. You start at the top."
 
-### Source 5: Steven Buccini's Blog Post (stevenbuccini.com, Jun 2020)
+### Source 5: Jorge Manrubia — "Globals, callbacks and other sacrileges" (Jul 2023)
+
+**URL:** https://dev.37signals.com/globals-callbacks-and-other-sacrileges/
+
+**What it is:** A blog post by Principal Programmer Jorge Manrubia showing how Basecamp
+uses Rails callbacks, `CurrentAttributes`, and `.suppress` — with concrete code examples
+from the Bucket/Recording/Event system.
+
+**Key learnings:**
+
+1. **Buckets use `delegated_type` too:** The post confirms the Bucket architecture with
+   a class diagram. A `Bucket` has a delegated type `Bucketable` (e.g. `Project`).
+   A `Bucket` contains many `Events`. An `Event` aggregates an `Event::Request`
+   (HTTP request metadata) and an `Event::Detail` (action-specific data).
+
+2. **Bucketable auto-creates its Bucket via callback:** The `Bucketable` concern uses
+   `after_create` to automatically create the companion Bucket record. This means the
+   controller can just do `Current.account.projects.create!` without knowing about
+   Buckets — the callback handles it. This is justified because the operation is
+   simple and secondary to the Project's primary responsibility.
+
+   ```ruby
+   module Bucketable
+     extend ActiveSupport::Concern
+     included do
+       after_create { create_bucket! account: account unless bucket.present? }
+     end
+   end
+   ```
+
+3. **Recordings use a factory (Recorder) instead of callbacks:** Unlike Bucketables,
+   creating recordings is more complex, so a `Bucket::Recorder` factory is used.
+   All recordings are created through `bucket.record(recordable, ...)`. This is the
+   canonical way to create content in Basecamp:
+
+   ```ruby
+   class Bucket < ApplicationRecord
+     def record(...)
+       Recorder.new(self).record(...)
+     end
+   end
+
+   # In a controller:
+   @recording = @bucket.record new_message,
+     parent: @parent_recording,
+     category: find_category,
+     subscribers: find_subscribers,
+     status: status_param
+   ```
+
+   This reveals that recording creation takes many parameters (parent, category,
+   subscribers, status, visibility, scheduled posting time) — too complex for a
+   simple callback, hence the factory.
+
+4. **`CurrentAttributes` for implicit creator tracking:** `Project` declares
+   `belongs_to :creator, default: -> { Current.person }`. The creator is automatically
+   set from the authenticated user without the controller needing to pass it. This
+   is used throughout Basecamp and HEY for audit tracking.
+
+5. **Event tracking via callbacks + CurrentAttributes:** The `Bucket::Eventable` concern
+   combines both patterns. An `after_create` callback calls `track_event(:created)`,
+   which creates an `Event` record. The event's creator defaults to `Current.person`.
+   The event then auto-builds an `Event::Request` that captures HTTP details
+   (`request_id`, `user_agent`, `ip_address`) from `Current`. The result: creating
+   a project automatically produces a fully-audited event with request metadata,
+   with zero explicit wiring in the controller.
+
+   ```ruby
+   module Bucket::Eventable
+     included do
+       has_many :events, dependent: :destroy
+       after_create :track_created
+     end
+
+     def track_event(action, creator: Current.person, **particulars)
+       Event.create! bucket: self, creator: creator, action: action,
+         detail: Event::Detail.new(particulars)
+     end
+   end
+   ```
+
+6. **`Event.suppress` for copying:** When copying recordings, the `Recording::Copier`
+   wraps the operation in `Event.suppress { ... }` to prevent the normal event
+   tracking from firing. This confirms that copying goes through
+   `destination_bucket.record(source_recording.recordable, ...)` — the copied
+   recording points to the same recordable instance. The `.suppress` mechanism
+   lets exceptional flows bypass normally-correct default behavior without adding
+   conditional logic to the event system itself.
+
+   ```ruby
+   class Recording::Copier
+     def copy_recording
+       Event.suppress do
+         @destination_recording = destination_bucket.record(
+           source_recording.recordable,
+           parent: destination_parent,
+           **copyable_attributes
+         )
+       end
+     end
+   end
+   ```
+
+7. **Architectural philosophy:** Callbacks + CurrentAttributes work well for
+   *orthogonal concerns* — things like auditing, event tracking, and creator
+   assignment that are secondary to the primary domain operation. The indirection
+   is a feature, not a bug. AOP (Aspect Oriented Programming) ideas, pragmatically
+   applied. The alternative (explicit factories/services wiring everything together)
+   couples unrelated concerns and bloats controllers.
+
+**Why this matters for porting:** When implementing recordables in another language,
+you need equivalents for:
+- **Lifecycle hooks** (after_create) to auto-create companion records
+- **Request-scoped globals** (CurrentAttributes) for implicit audit context
+- **A factory/builder** for recording creation (too complex for simple hooks)
+- **A suppression mechanism** for exceptional flows like copying
+
+### Source 6: Steven Buccini's Blog Post (stevenbuccini.com, Jun 2020)
 
 **URL:** https://www.stevenbuccini.com/how-to-use-delegate-types-in-rails-6-1
 
@@ -258,7 +375,7 @@ setup instructions.
   (recordable)      (recordable)      (recordable)
 ```
 
-### The Five Pillars
+### The Seven Pillars
 
 1. **Delegated Type:** One "superclass" table delegates its concrete type to separate
    "subclass" tables. Query the superclass for cross-type operations.
@@ -270,10 +387,20 @@ setup instructions.
    form a navigable hierarchy.
 
 4. **Event Log:** Events snapshot the recording-to-recordable relationship at a point
-   in time, enabling version history and audit trails.
+   in time, enabling version history and audit trails. Events auto-capture HTTP
+   request metadata (IP, user agent, request ID) via CurrentAttributes.
 
 5. **Opt-in Capabilities:** Recordable types declare which operations they support
    via boolean methods. Generic code checks these before acting.
+
+6. **Recorder Factory:** Recordings are created through `bucket.record(recordable, ...)`
+   — a factory that handles the complex wiring (parent, subscribers, status, etc.).
+   Simpler delegated types (like Bucketables) use lifecycle callbacks instead.
+
+7. **Implicit Context via CurrentAttributes:** Creator tracking, request metadata,
+   and account scoping flow implicitly through `Current.*` rather than being
+   threaded explicitly through every call site. Orthogonal concerns (auditing,
+   event tracking) attach via callbacks that read from this context.
 
 ### Why It Works
 
@@ -287,6 +414,8 @@ setup instructions.
 | Access control | Lives on bucket, decoupled from content type. |
 | API stability | New types don't break existing clients. Generic rendering. |
 | Moving content | Update recording's bucket/parent. Recordable unchanged. |
+| Auditing / tracking | Callbacks + CurrentAttributes auto-capture creator and request metadata |
+| Copying without side effects | `Event.suppress { }` bypasses event tracking during copy |
 
 ### Mapping to Other Languages
 
@@ -300,6 +429,9 @@ setup instructions.
 | `Recording.messages` scope | Query filter: `where("recordableType", "==", "message")` | `.filter(Recording.recordable_type == "message")` |
 | `delegate :title, to: :recordable` | Interface with `title` property, dispatch by type | Abstract method or protocol |
 | `after_create_commit` | Mutation + triggered function | Signal/event handler or post-commit hook |
+| `CurrentAttributes` | Request-scoped context (React context, AsyncLocalStorage, middleware) | `contextvars.ContextVar` or Flask `g` / FastAPI middleware |
+| `Bucket::Recorder` factory | Builder function: `createRecording(bucket, recordable, opts)` | Factory class or service method |
+| `Event.suppress { }` | Feature flag or context param: `{ suppressEvents: true }` | Context manager: `with suppress_events():` |
 
 ---
 
